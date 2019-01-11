@@ -1,0 +1,254 @@
+---
+title: "Weather Event Analysis"
+output:
+  pdf_document: default
+  html_document: default
+---
+#### Course 5 (Reproducible Research) / Assessment 2
+Paul Ringsted, 10th January 2019
+
+## Synopsis
+
+In this report we aim to identify the weather events in the United States which are most harmful to human health (in terms of fatalities or injuries) and have greatest economic impact (in terms of either crop or property damage).  The data used was the NOAA Storm Database from the National Weather Service, for the years 1996-2011.  The year 1996 was chosen as starting point for this analysis, as this was the year from which all weather types were recorded, not just tornados.  Processing was required on the data to derive the correct amounts based on representation of the data as value/exponent pairs, and to map weather event descriptions in the data to a standardized list of weather events.  The key conclusions of this analysis are that the weather events which are most harmful with respect to population health are Tornados, Excessive Heat, Floods and Flash Floods; the events which have the greatest economic impact are Floods, Hurricanes and Storm surge/tide.  Of note also were Thunderstorms, which have a very high frequency (>50%) of impactful events, and are the 4th highest contributor to injuries - but relatively low economic impact.  A key technical recommendation is for NWS to normalize this data at source to classify weather events against a consistent hierarchy of event types, rather than allowing free-form descriptions (if not already implemented).
+
+
+## Data Loading and Processing
+
+From the National Weather Service (NWS) / National Oceanic and Atmospheric Administration (NOAA) we obtained data on weather events dating from 1950 through 2011.  This database tracks characteristics of major storms and weather events in the United States, including when and where they occur, as well as estimates of any fatalities, injuries, and crop/property damage.  
+
+National Weather Service Storm Data Documentation:
+https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2Fpd01016005curr.pdf
+
+National Climatic Data Center Storm Events:
+https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2FNCDC%20Storm%20Events-FAQ%20Page.pdf
+
+
+### Dependencies
+
+The code in this analysis requires the following packages to be loaded:
+
+```{r libraries, message=FALSE}
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+```
+
+\newpage
+### Data Loading
+
+We first read the data from the raw text file included in the zip archive.  
+
+```{r loaddata, cache=TRUE}
+data <- read.csv('repdata-data-StormData.csv')
+```
+
+**The raw data contains `r nrow(data)` rows.  Note - the data is a simple comma-delimited field-quoted format, but includes carriage returns so the unix line count differs from the true record count in R.**
+
+### Data Processing
+
+#### Step 1 - Amounts and Timeframe
+
+For the purposes of this analysis, we are interested in the year, event type, and statistics on fatalities, injuries, and crop/property damage.  The columns required for this are first selected into a subset; event types and amount exponents are converted to upper case which also removes factors in these fields, and year is derived from the begin date of the event.  A field to map event types is initialized to N/A.
+
+```{r procdata1}
+datasub <- data[,c(2,8,23:28,37)]
+datasub$EVTYPE <- toupper(datasub$EVTYPE)
+datasub$CROPDMGEXP <- toupper(datasub$CROPDMGEXP)
+datasub$PROPDMGEXP <- toupper(datasub$PROPDMGEXP)
+datasub$BGN_DATE <- as.Date(datasub$BGN_DATE,"%m/%d/%Y")
+datasub$YEAR <- year(datasub$BGN_DATE)
+datasub$EVTYPEMAP <- as.character(NA)
+```
+
+The first issue to address is to derive the damage amounts.  For both crop and property damage, two fields are presented in the data, a 'DMG' field with a number, and a 'DMGEXP' field with an exponent multiplier.  For the DMGEXP values we leveraged earlier work done on analyzing these values vs. other databases (https://rstudio-pubs-static.s3.amazonaws.com/58957_37b6723ee52b455990e149edde45e5b6.html), which can be summarized as follows:
+
+* (-) = 0
+* (?) = 0
+* black/empty character = 0
+* (+) = 1
+* numeric 0..8 = 10
+* H,h = hundreds = 100
+* K,k = kilos = thousands = 1,000
+* M,m = millions = 1,000,000
+* B,b = billions = 1,000,000,000
+
+A lookup data frame mapping EXP to the multiplier value is constructed and used to derive new 'AMOUNT' fields in our results subset.  The final amounts are represented in millions.
+
+```{r procdata2}
+EXP <- c("","-","?","+","0","1","2","3","4","5","6","7","8","H","K","M","B")
+VAL <- c(0,0,0,1,rep(10,9),100,1000,1000000,1000000000)
+Lookup <- data.frame(cbind(EXP,VAL))
+Lookup$EXP <- as.character(Lookup$EXP)
+Lookup$VAL <- as.numeric(as.character(Lookup$VAL))
+datasub$CROPFAC <- Lookup[match(datasub$CROPDMGEXP,Lookup$EXP),]$VAL
+datasub$PROPFAC <- Lookup[match(datasub$PROPDMGEXP,Lookup$EXP),]$VAL
+datasub$CROPAMOUNT <- (datasub$CROPDMG * datasub$CROPFAC)/1000000
+datasub$PROPAMOUNT <- (datasub$PROPDMG * datasub$PROPFAC)/1000000
+```
+
+The second issue to address is the timeframe of data.  Per guidance in the notes on the discussion forum for this course, only Tornados were recorded in earlier years, with a gradual increase in events recorded, but from 1996 onwards the full range of events is recorded.  A quick exploratory plot of total damage by year supports this, as it shows a significant uptick in damage amounts starting in the early 1990s. 
+
+```{r procdata3}
+datasub_yearly<-aggregate((datasub$PROPAMOUNT+datasub$CROPAMOUNT)/1000,
+                                by=list(datasub$YEAR),FUN="sum")
+plot(datasub_yearly,xlab="Year",ylab="Damage Amount ($Billions)")
+```
+
+**Therefore, in order to provide a consistent dataset for comparison across weather events, we selected only rows for events which began in 1996 onwards.  Also, to reduce the dataset for the next step of processing which involves cleaning up event types, we only select 'impactful events' i.e. rows which have non-zero fatalities, injuries or damage:**
+
+```{r procdata4}
+dataevt <- datasub[which((datasub$FATALITIES+datasub$INJURIES
+                        +datasub$CROPAMOUNT+datasub$PROPAMOUNT>0)
+                        & datasub$YEAR>=1996),]
+```
+
+**This subset of data for analysis contains `r nrow(dataevt)` rows/events.**
+
+
+
+\newpage
+#### Step 2 - Event Type Mapping
+
+The second major issue to address is normalization of the event types, which is free-form field in the NOAA data.  Documentation for the dataset refers to 48 groupings of weather type, which was used as the basis for this analysis, plus an additional "OTHER" category.
+
+The list of events was mapped to these categories using a .csv mapping file consisting of grepl match string (with .* wildcards) and the target category.  The code loops through each row of this mapping file in order, and only processes events which have not previously been mapped (mapped event type is still N/A).
+
+Order of processing this file is important in order to classify more specific events before generic ones e.g. "HEAVY RAIN" should be processed before catch-all for anything left-over with "RAIN", otherwise HEAVY RAIN will be mapped to RAIN. The mappings are displayed in the output of the R loop (full evtypemap.csv file can be found at https://github.com/ringspagit/RepData_PeerAssessment2).
+
+**Note at this point in the analysis we combined property and crop damage into a singular AMOUNT field.  However fatalities and injuries remain separate as combination of this data would obfuscate the impact of fatal weather events.**
+
+```{r procdata5}
+# Gather summary table of events to be mapped, combine property and crop damage amounts
+evtypes <- dataevt %>% group_by(EVTYPE) %>%
+        summarise(length(unique(REFNUM)),
+                sum(CROPAMOUNT+PROPAMOUNT),
+                sum(FATALITIES),sum(INJURIES))
+colnames(evtypes) <- c('EVTYPE','EVENTS','AMOUNT','FATALITIES','INJURIES')
+
+# Load mapping file and default the EVTYPEMAP field to N/A
+evtypemap <- read.csv('evtypemap.csv',comment.char="#")
+evtypemap$MAPTO <- as.character(evtypemap$MAPTO)
+evtypes$EVTYPEMAP <- as.character(NA)
+
+#Loop thru each mapping row, find subset of matches with grepl
+#which still have N/A for EVTYPEMAP and map to new lookup value
+for (i in 1:nrow(evtypemap)) {
+        repl <- with(evtypes,grepl(evtypemap[i,]$SEARCH,EVTYPE) & is.na(EVTYPEMAP))
+        print(paste0('Mapping: ',sum(repl),' rows ',
+                     evtypemap[i,]$SEARCH,' to ',evtypemap[i,]$MAPTO))
+        if (sum(repl) > 0) {
+                evtypes[which(repl),]$EVTYPEMAP <- evtypemap[i,]$MAPTO
+        }
+}
+# Print final summary
+print(paste(sum(!is.na(evtypes$EVTYPEMAP)),' mapped'))
+print(paste(sum(is.na(evtypes$EVTYPEMAP)),' unmapped'))
+```
+
+
+This data is then re-summarized based on the mapped event types
+
+```{r procdata6}
+evsum <- as.data.frame(evtypes %>% group_by(EVTYPEMAP) %>%
+                summarise(sum(EVENTS),sum(AMOUNT),sum(FATALITIES),sum(INJURIES)))
+colnames(evsum) <- c('EVTYPE_MAPPED','EVENTS','AMOUNT','FATALITIES','INJURIES')
+```
+
+**This summary dataset consists of `r nrow(evsum)` rows corresponding to `r sum(evsum$EVENTS)` events (control total compare to original subset of event level detail which had `r nrow(dataevt)` rows).**
+
+
+Notes:
+
+* Summary table of all mapped event types is provided in the Results section.
+
+* The summarized data set does not contain all 49 events (the NOAA 48 event types, plus 'OTHER') because there was no data directly corresponding to SLEET.
+
+* There is an element of subjectivity in the mapping, and further higher grouping which could be performed at this point.  For example, is there an important distinction between different densities of hazardous FOG, or different types of winter weather.  This was beyond the scope of this analysis, and does not appear to be material to the main conclusions, but something for further consideration if deeper analysis required.
+
+* The mapping csv file was constructed by starting with the 48 event types provided in the NWS document, then iteratively updating the file for additional patterns by observing remaining events to be mapped, and re-running the assignment process, until all of the event types in the dataset were mapped.  Sanity checks were performed by listing the original and mapped event types in order of mapping to see that similar events (e.g. various types of wind) were mapped consistently.  The following R code was useful for this (output not shown here):
+```{r procdata5extra, results="hide"}
+as.data.frame(evtypes[order(evtypes$EVTYPEMAP,evtypes$EVTYPE),])
+```
+
+
+
+\newpage
+#### Step 3 - Selecting the Most Impactful Events
+
+Next, this event level data was re-cast as percentages of the impact totals, to help visualize the relative impact of an event between health and economy on a consistent scale.
+
+```{r procdata7}
+evsum_pct <- cbind(
+        evsum[1],
+        round(prop.table(evsum[2])*100,1),
+        round(prop.table(evsum[3])*100,1),
+        round(prop.table(evsum[4])*100,1),
+        round(prop.table(evsum[5])*100,1))
+```
+
+In order to see which of the `r nrow(evsum_pct)` events have the biggest impact on health and economy, the data set was reduced to a superset of events containing the top 5 most impactful events for each of fatalities, injuries and damage amount, along with a normalized form of this data to support plotting.
+
+```{r procdata8}
+evsum_pct$TOP <- FALSE
+evsum_pct[order(-evsum_pct$AMOUNT),][c(1:5),]$TOP <- TRUE
+evsum_pct[order(-evsum_pct$FATALITIES),][c(1:5),]$TOP <- TRUE
+evsum_pct[order(-evsum_pct$INJURIES),][c(1:5),]$TOP <- TRUE
+
+evtop<-evsum_pct[which(evsum_pct$TOP),]
+
+# Normalize data into rows for plotting
+evtopnorm<-as.data.frame(evtop[c(1,3:5)] %>% gather(IMPACT,COUNT,-EVTYPE_MAPPED))
+```
+
+**This results in a population of `r nrow(evtop)` key events for final analysis**
+
+
+\newpage
+## Results
+
+Plotting the percentages of these `r nrow(evtop)` key events illustrates the finding in the data, narrowing down to the Top 3, with emphasis at 10% or higher:
+
+* The weather events which have the greatest **population health** (fatalities or injuries) impact are **Tornados, Excessive Heat, Floods and Flash Floods**.
+
+* The weather events which have the greatest **economic** consequences are **Floods, Hurricanes and Storm surge/tide**.
+
+* Of additional note in the data are **Thunderstorms** which have a very high frequency (>50%) of impactful events, and the 4th highest impactful to health via injury, though present a low economic impact.
+
+```{r plotdata1}
+g <- ggplot(evtopnorm,aes(x=EVTYPE_MAPPED,y=COUNT,fill=IMPACT))
+g <- g + geom_bar(stat="identity")
+g <- g + facet_grid(rows = vars(IMPACT))
+g <- g + labs(x="Weather Event (Top 5 Injuries, Fatalities or Economic Impact)",y="% of Total")
+g <- g + theme(axis.text.x = element_text(angle = 50, hjust = 1))
+g <- g + geom_hline(yintercept=10)
+print(g)
+```
+
+\newpage
+
+**Summary of impact (%) for key events:**
+```{r plotdata2}
+evtop[c(1:5)] %>% kable() %>% kable_styling()
+```
+
+**Summary of impact ($MM/count) for key events:**
+```{r plotdata2.1}
+evsum[which(evsum_pct$TOP),][c(1:5)] %>% kable() %>% kable_styling()
+```
+
+\newpage
+
+**Summary of impact (%) for all events:**
+```{r plotdata3}
+evsum_pct %>% kable() %>% kable_styling()
+```
+
+\newpage
+
+**Summary of impact ($MM/count) for all events:**
+```{r plotdata3.1}
+evsum %>% kable() %>% kable_styling()
+```
